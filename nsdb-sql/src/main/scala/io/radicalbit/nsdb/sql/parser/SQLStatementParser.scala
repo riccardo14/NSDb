@@ -120,8 +120,8 @@ final class SQLStatementParser extends RegexParsers with PackratParsers with Reg
   }
   private val dimension = digits
   private val stringValue = (digitsWithDashes | (("'" ?) ~> (digitsWithDashes +) <~ ("'" ?))) ^^ {
-    case string: String        => string
-    case strings: List[String] => strings.mkString(" ")
+    case string: String   => string
+    case strings: List[_] => strings.mkString(" ")
   }
   private val stringValueWithWildcards = """(^[a-zA-Z_$][a-zA-Z0-9_\-$]*[a-zA-Z0-9$])""".r
 

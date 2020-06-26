@@ -27,10 +27,9 @@ import io.radicalbit.nsdb.cluster.PubSubTopics._
 import io.radicalbit.nsdb.cluster.coordinator.MetadataCoordinator.commands.GetLocations
 import io.radicalbit.nsdb.cluster.coordinator.MetadataCoordinator.events.LocationsGot
 import io.radicalbit.nsdb.cluster.logic.ReadNodesSelection
-import io.radicalbit.nsdb.common.{NSDbNumericType, NSDbType}
+import io.radicalbit.nsdb.common.NSDbNumericType
 import io.radicalbit.nsdb.common.protocol.Bit
 import io.radicalbit.nsdb.common.statement.SelectSQLStatement
-import io.radicalbit.nsdb.index.NumericType
 import io.radicalbit.nsdb.model.{Location, Schema, TimeRange}
 import io.radicalbit.nsdb.post_proc._
 import io.radicalbit.nsdb.protocol.MessageProtocol.Commands._
@@ -208,15 +207,16 @@ class ReadCoordinator(metadataCoordinator: ActorRef,
               case Right(ParsedSimpleQuery(_, _, _, false, limit, fields, _))
                   if fields.lengthCompare(1) == 0 && fields.head.count =>
                 gatherNodeResults(statement, schema, uniqueLocationsByNode) { seq =>
-                  val recordCount = seq.map(_.value.rawValue.asInstanceOf[Int]).sum
-                  val count       = if (recordCount <= limit) recordCount else limit
+                  val recordCount = seq.map(_.value).sum
+                  val count       = if (recordCount <= limit) recordCount else NSDbNumericType(limit)
                   applyOrderingWithLimit(
-                    Seq(Bit(
-                      timestamp = 0,
-                      value = NSDbNumericType(count),
-                      dimensions = retrieveCount(seq, count, (bit: Bit) => bit.dimensions),
-                      tags = retrieveCount(seq, count, (bit: Bit) => bit.tags)
-                    )),
+                    Seq(
+                      Bit(
+                        timestamp = 0,
+                        value = count,
+                        dimensions = retrieveCount(seq, count, bit => bit.dimensions),
+                        tags = retrieveCount(seq, count, bit => bit.tags)
+                      )),
                     statement,
                     schema
                   )
@@ -238,39 +238,20 @@ class ReadCoordinator(metadataCoordinator: ActorRef,
                   )
                 }.map(limitAndOrder(_, statement, schema))
 
-              case Right(ParsedAggregatedQuery(_, _, _, agg: InternalCountSimpleAggregation, _, _)) =>
-                gatherAndGroupNodeResults(statement, statement.groupBy.get.field, schema, uniqueLocationsByNode) {
-                  bits =>
-                    Bit(
-                      timestamp = 0,
-                      value = NSDbNumericType(bits.map(_.value.rawValue.asInstanceOf[Long]).sum),
-                      dimensions = foldMapOfBit(bits, bit => bit.dimensions),
-                      tags = foldMapOfBit(bits, bit => bit.tags)
-                    )
-                }.map(limitAndOrder(_, statement, schema, Some(agg)))
-
-              case Right(ParsedAggregatedQuery(_, _, _, InternalAvgSimpleAggregation(groupField, _), _, _)) =>
-                gatherAndGroupNodeResults(statement, statement.groupBy.get.field, schema, uniqueLocationsByNode) {
-                  bits =>
-                    val v                              = schema.value.indexType.asInstanceOf[NumericType[_]]
-                    implicit val numeric: Numeric[Any] = v.numeric
-
-                    val sum   = NSDbNumericType(bits.flatMap(_.tags.get("sum").map(_.rawValue)).sum)
-                    val count = NSDbNumericType(bits.flatMap(_.tags.get("count").map(_.rawValue)).sum)
-                    val avg   = NSDbNumericType(sum / count)
-                    Bit(
-                      timestamp = 0L,
-                      value = avg,
-                      dimensions = Map.empty[String, NSDbType],
-                      tags = retrieveField(bits, groupField, bit => bit.tags)
-                    )
-                }.map(limitAndOrder(_, statement, schema))
-
+              // simple aggregation
               case Right(ParsedAggregatedQuery(_, _, _, aggregationType, _, _)) =>
                 gatherAndGroupNodeResults(statement, statement.groupBy.get.field, schema, uniqueLocationsByNode)(
-                  internalAggregationProcessing(_, schema, aggregationType)
-                ).map(limitAndOrder(_, statement, schema))
+                  internalAggregationProcessing(_, aggregationType)
+                ).map(
+                  limitAndOrder(_,
+                                statement,
+                                schema,
+                                aggregationType =
+                                  if (aggregationType.isInstanceOf[InternalCountSimpleAggregation])
+                                    Some(aggregationType)
+                                  else None))
 
+              // temporal aggregation
               case Right(ParsedTemporalAggregatedQuery(_, _, _, rangeLength, aggregationType, condition, _, _)) =>
                 val sortedLocations = filteredLocations.sortBy(_.from)
 

@@ -208,7 +208,7 @@ class MetricAccumulatorActor(val basePath: String,
       sender ! RecordDeleted(db, ns, key.metric, bit)
     case ExecuteDeleteStatementInShards(statement, schema, keys) =>
       StatementParser.parseStatement(statement, schema) match {
-        case Right(ParsedDeleteQuery(ns, metric, q)) =>
+        case Right(ParsedDeleteQuery(ns, metric, _)) =>
           keys.foreach { key =>
             opBufferMap += (UUID.randomUUID().toString -> DeleteShardQueryOperation(ns, key, statement, schema))
           }

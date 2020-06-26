@@ -27,9 +27,8 @@ import io.radicalbit.nsdb.actors.ShardReaderActor.RefreshShard
 import io.radicalbit.nsdb.common.protocol.{Bit, DimensionFieldType, ValueFieldType}
 import io.radicalbit.nsdb.common.statement.{DescOrderOperator, SelectSQLStatement}
 import io.radicalbit.nsdb.common.{NSDbLongType, NSDbNumericType, NSDbType}
-import io.radicalbit.nsdb.index.NumericType
 import io.radicalbit.nsdb.model.Location
-import io.radicalbit.nsdb.post_proc.{foldMapOfBit, internalAggregationProcessing, postProcessingTemporalQueryResult}
+import io.radicalbit.nsdb.post_proc._
 import io.radicalbit.nsdb.protocol.MessageProtocol.Commands._
 import io.radicalbit.nsdb.protocol.MessageProtocol.Events._
 import io.radicalbit.nsdb.statement.StatementParser
@@ -274,15 +273,14 @@ class MetricReaderActor(val basePath: String, nodeName: String, val db: String, 
             .map {
               case SelectStatementExecuted(_, seq) =>
                 if (fields.lengthCompare(1) == 0 && fields.head.count) {
-                  val recordCount = seq.map(_.value.rawValue.asInstanceOf[Int]).sum
-                  val count       = if (recordCount <= limit) recordCount else limit
-
+                  val recordCount = seq.map(_.value).sum
+                  val count       = if (recordCount <= limit) recordCount else NSDbNumericType(limit)
                   val bits = Seq(
                     Bit(
                       timestamp = 0,
-                      value = NSDbNumericType(count),
-                      dimensions = retrieveCount(seq, count, (bit: Bit) => bit.dimensions),
-                      tags = retrieveCount(seq, count, (bit: Bit) => bit.tags)
+                      value = count,
+                      dimensions = retrieveCount(seq, count, bit => bit.dimensions),
+                      tags = retrieveCount(seq, count, bit => bit.tags)
                     ))
 
                   SelectStatementExecuted(statement, bits)
@@ -315,48 +313,25 @@ class MetricReaderActor(val basePath: String, nodeName: String, val db: String, 
           }
 
           shardResults.pipeTo(sender)
-        case Right(ParsedAggregatedQuery(_, _, _, _: InternalCountSimpleAggregation, _, _)) =>
-          val filteredIndexes =
-            actorsForLocations(locations)
 
-          val shardResults =
-            gatherAndGroupShardResults(statement, filteredIndexes, statement.groupBy.get.field, msg) { values =>
-              Bit(0,
-                  NSDbNumericType(values.map(_.value.rawValue.asInstanceOf[Long]).sum),
-                  foldMapOfBit(values, bit => bit.dimensions),
-                  foldMapOfBit(values, bit => bit.tags))
-            }
-
-          shardResults.pipeTo(sender)
-
-        case Right(ParsedAggregatedQuery(_, _, _, InternalAvgSimpleAggregation(groupField, _), _, _)) =>
+        case Right(ParsedAggregatedQuery(_, _, _, aggregation @ InternalAvgSimpleAggregation(groupField, _), _, _)) =>
           val filteredIndexes =
             actorsForLocations(locations)
 
           val shardResults =
             gatherAndGroupShardResults(statement, filteredIndexes, statement.groupBy.get.field, msg) { bits =>
-              val v                              = schema.value.indexType.asInstanceOf[NumericType[_]]
-              implicit val numeric: Numeric[Any] = v.numeric
-
-              if (isSingleNode) {
-                val sum   = NSDbNumericType(bits.flatMap(_.tags.get("sum").map(_.rawValue)).sum)
-                val count = NSDbNumericType(bits.flatMap(_.tags.get("count").map(_.rawValue)).sum)
-                val avg   = NSDbNumericType(sum / count)
+              if (isSingleNode) internalAggregationProcessing(bits, aggregation)
+              else {
+                val sum   = bits.flatMap(_.tags.get("sum")).map(_.asInstanceOf[NSDbNumericType]).sum
+                val count = bits.flatMap(_.tags.get("count")).map(_.asInstanceOf[NSDbNumericType]).sum
                 Bit(
-                  0L,
-                  avg,
-                  Map.empty[String, NSDbType],
-                  retrieveField(bits, groupField, bit => bit.tags)
-                )
-              } else {
-                Bit(
-                  0L,
-                  NSDbNumericType(0),
-                  Map.empty[String, NSDbType],
-                  Map(
+                  timestamp = 0,
+                  value = NSDbNumericType(0),
+                  dimensions = Map.empty[String, NSDbType],
+                  tags = Map(
                     groupField -> bits.flatMap(_.tags.get(groupField)).head,
-                    "sum"      -> NSDbNumericType(bits.flatMap(_.tags.get("sum").map(_.rawValue)).sum),
-                    "count"    -> NSDbNumericType(bits.flatMap(_.tags.get("count").map(_.rawValue)).sum)
+                    "sum"      -> sum,
+                    "count"    -> count
                   )
                 )
               }
@@ -370,7 +345,7 @@ class MetricReaderActor(val basePath: String, nodeName: String, val db: String, 
 
           val shardResults =
             gatherAndGroupShardResults(statement, filteredIndexes, statement.groupBy.get.field, msg)(
-              internalAggregationProcessing(_, schema, aggregationType))
+              internalAggregationProcessing(_, aggregationType))
 
           shardResults.pipeTo(sender)
         case Right(ParsedTemporalAggregatedQuery(_, _, _, _, aggregationType, _, _, _)) =>
@@ -409,38 +384,6 @@ class MetricReaderActor(val basePath: String, nodeName: String, val db: String, 
   }
 
   override def receive: Receive = readOps
-
-  /**
-    * This is a utility method to extract dimensions or tags from a Bit sequence in a functional way without having
-    * the risk to throw dangerous exceptions.
-    *
-    * @param values the sequence of bits holding the fields to be extracted.
-    * @param field the name of the field to be extracted.
-    * @param extract the function defining how to extract the field from a given bit.
-    * @return
-    */
-  private def retrieveField(values: Seq[Bit],
-                            field: String,
-                            extract: Bit => Map[String, NSDbType]): Map[String, NSDbType] =
-    values.headOption
-      .flatMap(bit => extract(bit).get(field).map(x => Map(field -> x)))
-      .getOrElse(Map.empty[String, NSDbType])
-
-  /**
-    * This is a utility method in charge to associate a dimension or a tag with the given count.
-    * It extracts the field from a Bit sequence in a functional way without having the risk to throw dangerous exceptions.
-    *
-    * @param values the sequence of bits holding the field to be extracted.
-    * @param count the value of the count to be associated with the field.
-    * @param extract the function defining how to extract the field from a given bit.
-    * @return
-    */
-  private def retrieveCount(values: Seq[Bit],
-                            count: Long,
-                            extract: Bit => Map[String, NSDbType]): Map[String, NSDbType] =
-    values.headOption
-      .flatMap(bit => extract(bit).headOption.map(x => Map(x._1 -> NSDbType(count))))
-      .getOrElse(Map.empty[String, NSDbType])
 
 }
 
